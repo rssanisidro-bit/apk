@@ -9,6 +9,7 @@ import time
 import zipfile
 from pathlib import Path
 
+from kivy.utils import platform
 from kivy.app import App
 from kivy.clock import mainthread
 from kivy.core.text import LabelBase
@@ -59,6 +60,103 @@ for font_path in FONT_CANDIDATES:
         LabelBase.register(name="FileLinkCJK", fn_regular=font_path)
         APP_FONT = "FileLinkCJK"
         break
+
+
+def request_android_storage_permissions():
+    if platform != "android":
+        return
+    try:
+        from android.permissions import Permission, request_permissions
+
+        names = [
+            "READ_EXTERNAL_STORAGE",
+            "WRITE_EXTERNAL_STORAGE",
+            "READ_MEDIA_IMAGES",
+            "READ_MEDIA_VIDEO",
+            "READ_MEDIA_AUDIO",
+        ]
+        permissions = [getattr(Permission, name) for name in names if hasattr(Permission, name)]
+        request_permissions(permissions)
+    except Exception:
+        pass
+
+
+def first_existing_path(candidates):
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return str(Path.home())
+
+
+def default_file_path():
+    if platform == "android":
+        return first_existing_path(
+            [
+                "/storage/emulated/0/Download",
+                "/storage/emulated/0/Downloads",
+                "/storage/emulated/0/DCIM",
+                "/storage/emulated/0/Documents",
+                "/storage/emulated/0",
+            ]
+        )
+    return str(Path.home())
+
+
+def default_save_path():
+    if platform == "android":
+        return first_existing_path(
+            [
+                "/storage/emulated/0/Download/北洋闪传",
+                "/storage/emulated/0/Download",
+                "/storage/emulated/0/Downloads",
+                "/storage/emulated/0/Documents",
+                "/storage/emulated/0",
+            ]
+        )
+    return str(Path.home() / "Downloads")
+
+
+def copy_android_content_uri(uri):
+    if platform != "android" or not uri.startswith("content://"):
+        return uri
+    try:
+        from jnius import autoclass, jarray
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Uri = autoclass("android.net.Uri")
+        OpenableColumns = autoclass("android.provider.OpenableColumns")
+
+        activity = PythonActivity.mActivity
+        resolver = activity.getContentResolver()
+        parsed_uri = Uri.parse(uri)
+        filename = "selected_file"
+
+        cursor = resolver.query(parsed_uri, None, None, None, None)
+        if cursor:
+            try:
+                name_index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if name_index >= 0 and cursor.moveToFirst():
+                    filename = cursor.getString(name_index) or filename
+            finally:
+                cursor.close()
+
+        safe_name = os.path.basename(filename).replace("/", "_").replace("\\", "_")
+        target = os.path.join(tempfile.gettempdir(), safe_name)
+        stream = resolver.openInputStream(parsed_uri)
+        if stream is None:
+            raise OSError("无法打开系统文件流")
+
+        with open(target, "wb") as out:
+            buffer = jarray("b")(64 * 1024)
+            while True:
+                read = stream.read(buffer)
+                if read == -1:
+                    break
+                out.write(bytes((value & 0xFF for value in buffer[:read])))
+        stream.close()
+        return target
+    except Exception as exc:
+        raise OSError(f"无法读取系统选择的文件：{exc}") from exc
 
 
 def recvall(sock, size):
@@ -280,11 +378,16 @@ class ModernTextInput(TextInput):
 class FileTransferApp(App):
     def build(self):
         Window.clearcolor = COLORS["bg"]
+        request_android_storage_permissions()
         self.cancel_event = threading.Event()
         self.server_sock = None
         self.active_sock = None
         self.selected_file = None
-        self.save_dir = str(Path.home() / "Downloads")
+        self.save_dir = default_save_path()
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+        except OSError:
+            pass
         self.temp_zip = None
         self.local_ips = get_local_ips()
         self.current_start_time = None
@@ -329,7 +432,7 @@ class FileTransferApp(App):
         title_box = BoxLayout(orientation="vertical", spacing=dp(2))
         title_box.add_widget(
             Label(
-                text="FileLink 速传",
+                text="北洋闪传",
                 font_name=APP_FONT,
                 color=(1, 1, 1, 1),
                 bold=True,
@@ -523,7 +626,7 @@ class FileTransferApp(App):
         card = Card(orientation="vertical", size_hint_y=None, height=dp(230))
         card.add_widget(SectionTitle("运行记录"))
         self.log_label = AppLabel(
-            text="欢迎使用 FileLink。请确保两台设备在同一个校园网或局域网内。",
+            text="欢迎使用北洋闪传。请确保两台设备在同一个校园网或局域网内。",
             color=COLORS["muted"],
             font_size_value=13,
             size_hint_y=None,
@@ -543,7 +646,17 @@ class FileTransferApp(App):
         self.log("已刷新本机 IP。")
 
     def open_file_picker(self):
-        chooser = FileChooserIconView(path=str(Path.home()))
+        if platform == "android":
+            try:
+                from plyer import filechooser
+
+                filechooser.open_file(on_selection=self.on_native_file_selected)
+                self.log("已打开系统文件选择器。")
+                return
+            except Exception as exc:
+                self.log(f"系统文件选择器不可用，改用内置选择器：{exc}")
+
+        chooser = FileChooserIconView(path=default_file_path())
         popup = self.make_picker_popup("选择要发送的文件", chooser)
 
         def choose(*_):
@@ -558,6 +671,16 @@ class FileTransferApp(App):
         popup.open()
 
     def open_folder_picker(self):
+        if platform == "android":
+            try:
+                from plyer import filechooser
+
+                filechooser.choose_dir(on_selection=self.on_native_folder_selected)
+                self.log("已打开系统目录选择器。")
+                return
+            except Exception as exc:
+                self.log(f"系统目录选择器不可用，改用内置选择器：{exc}")
+
         chooser = FileChooserIconView(path=self.save_dir, dirselect=True)
         popup = self.make_picker_popup("选择接收保存目录", chooser)
 
@@ -572,6 +695,41 @@ class FileTransferApp(App):
         popup.ok_button.bind(on_press=choose)
         popup.open()
 
+    @mainthread
+    def on_native_file_selected(self, selection):
+        if not selection:
+            return
+        selected = selection[0]
+        if selected.startswith("content://"):
+            try:
+                selected = copy_android_content_uri(selected)
+                self.log("已读取系统文件选择器返回的文件。")
+            except OSError as exc:
+                self.log(str(exc))
+                return
+        if os.path.isfile(selected):
+            self.selected_file = selected
+            size_text = format_bytes(os.path.getsize(self.selected_file))
+            self.file_label.text = f"待发送文件：{os.path.basename(self.selected_file)}  ({size_text})"
+            self.log(f"已选择文件：{self.selected_file}")
+        else:
+            self.log(f"未能读取所选文件：{selected}")
+
+    @mainthread
+    def on_native_folder_selected(self, selection):
+        if not selection:
+            return
+        selected = selection[0]
+        if selected.startswith("content://"):
+            self.log("系统返回的是 content:// 目录地址，已继续使用默认 Download 保存位置。")
+            return
+        if os.path.isdir(selected):
+            self.save_dir = selected
+            self.save_label.text = f"保存位置：{self.save_dir}"
+            self.log(f"保存位置已设置为：{self.save_dir}")
+        else:
+            self.log(f"未能读取所选目录：{selected}")
+
     def make_picker_popup(self, title, chooser):
         panel = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         panel.add_widget(chooser)
@@ -585,7 +743,13 @@ class FileTransferApp(App):
         button_row.add_widget(cancel)
         button_row.add_widget(ok)
         panel.add_widget(button_row)
-        popup = Popup(title=title, content=panel, size_hint=(0.92, 0.9))
+        popup = Popup(
+            title=title,
+            title_font=APP_FONT,
+            title_size=sp(18),
+            content=panel,
+            size_hint=(0.92, 0.9),
+        )
         popup.ok_button = ok
         cancel.bind(on_press=lambda *_: popup.dismiss())
         return popup

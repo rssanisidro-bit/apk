@@ -1,6 +1,6 @@
-# FileLink 速传
+# 北洋闪传
 
-`FileLink 速传` 是根据 `lec22 网络编程.pdf` 中“挑战2：文件速传”要求完成的 Kivy 应用。新版界面参考现代移动工具类 App：顶部品牌区、步骤化操作卡片、清晰的发送/接收入口、实时传输监控和运行记录。
+`北洋闪传` 是根据 `lec22 网络编程.pdf` 中“挑战2：文件速传”要求完成的 Kivy 应用。新版界面参考现代移动工具类 App：顶部品牌区、步骤化操作卡片、清晰的发送/接收入口、实时传输监控和运行记录，并使用蓝色系应用图标。
 
 ## 功能完成情况
 
@@ -51,7 +51,7 @@ python main.py
 3. 打开仓库页面的 `Actions`。
 4. 选择 `Build Android APK`。
 5. 点击 `Run workflow`。
-6. 等待完成后，在运行结果页面的 `Artifacts` 下载 `FileLink-debug-apk`。
+6. 等待完成后，在运行结果页面的 `Artifacts` 下载 `BeiyangFlash-debug-apk`。
 7. 解压后即可得到 `.apk` 安装包。
 
 第一次云端构建通常需要 20-60 分钟，因为要下载 Android SDK/NDK 和编译依赖。
