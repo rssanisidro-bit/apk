@@ -104,9 +104,8 @@ def default_file_path():
 
 def default_save_path():
     if platform == "android":
-        return first_existing_path(
+        return android_app_external_files_path() or first_existing_path(
             [
-                "/storage/emulated/0/Download/北洋闪传",
                 "/storage/emulated/0/Download",
                 "/storage/emulated/0/Downloads",
                 "/storage/emulated/0/Documents",
@@ -114,6 +113,36 @@ def default_save_path():
             ]
         )
     return str(Path.home() / "Downloads")
+
+
+def android_app_external_files_path():
+    if platform != "android":
+        return None
+    try:
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        folder = activity.getExternalFilesDir(None)
+        if folder:
+            return os.path.join(folder.getAbsolutePath(), "北洋闪传")
+    except Exception:
+        pass
+    return "/storage/emulated/0/Android/data/org.tju.challenge.beiyangflashtransfer/files/北洋闪传"
+
+
+def android_save_choices():
+    choices = []
+    app_path = android_app_external_files_path()
+    if app_path:
+        choices.append(("应用专用目录（最稳）", app_path))
+    choices.extend([
+        ("下载/北洋闪传", "/storage/emulated/0/Download/北洋闪传"),
+        ("文档/北洋闪传", "/storage/emulated/0/Documents/北洋闪传"),
+        ("相册/北洋闪传", "/storage/emulated/0/DCIM/北洋闪传"),
+        ("下载根目录", "/storage/emulated/0/Download"),
+    ])
+    return choices
 
 
 def copy_android_content_uri(uri):
@@ -672,14 +701,8 @@ class FileTransferApp(App):
 
     def open_folder_picker(self):
         if platform == "android":
-            try:
-                from plyer import filechooser
-
-                filechooser.choose_dir(on_selection=self.on_native_folder_selected)
-                self.log("已打开系统目录选择器。")
-                return
-            except Exception as exc:
-                self.log(f"系统目录选择器不可用，改用内置选择器：{exc}")
+            self.open_android_save_picker()
+            return
 
         chooser = FileChooserIconView(path=self.save_dir, dirselect=True)
         popup = self.make_picker_popup("选择接收保存目录", chooser)
@@ -694,6 +717,86 @@ class FileTransferApp(App):
 
         popup.ok_button.bind(on_press=choose)
         popup.open()
+
+    def open_android_save_picker(self):
+        panel = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        panel.add_widget(
+            AppLabel(
+                text="选择接收文件保存位置",
+                bold=True,
+                font_size_value=18,
+                size_hint_y=None,
+                height=dp(34),
+            )
+        )
+        panel.add_widget(
+            MutedLabel(
+                text="推荐使用 Download/北洋闪传。部分校园手机系统会限制任意目录写入。",
+                size_hint_y=None,
+                height=dp(44),
+            )
+        )
+
+        for label, path in android_save_choices():
+            btn = RoundedButton(
+                text=f"{label}\n{path}",
+                bg_color=(0.90, 0.94, 0.99, 1),
+                text_color=COLORS["primary_dark"],
+                height=60,
+            )
+            btn.bind(on_press=lambda _btn, selected=path: self.apply_save_dir(selected, popup))
+            panel.add_widget(btn)
+
+        manual_label = MutedLabel(text="手动路径", size_hint_y=None, height=dp(24))
+        panel.add_widget(manual_label)
+        manual_input = ModernTextInput(text=self.save_dir, hint_text="/storage/emulated/0/Download/北洋闪传")
+        panel.add_widget(manual_input)
+
+        button_row = GridLayout(cols=2, spacing=dp(8), size_hint_y=None, height=dp(48))
+        cancel = RoundedButton(
+            text="取消",
+            bg_color=(0.90, 0.94, 0.99, 1),
+            text_color=COLORS["primary_dark"],
+        )
+        ok = RoundedButton(text="使用此路径", bg_color=COLORS["primary"])
+        button_row.add_widget(cancel)
+        button_row.add_widget(ok)
+        panel.add_widget(button_row)
+
+        popup = Popup(
+            title="保存位置",
+            title_font=APP_FONT,
+            title_size=sp(18),
+            content=panel,
+            size_hint=(0.92, 0.82),
+        )
+        cancel.bind(on_press=lambda *_: popup.dismiss())
+        ok.bind(on_press=lambda *_: self.apply_save_dir(manual_input.text.strip(), popup))
+        popup.open()
+
+    def apply_save_dir(self, selected, popup=None):
+        if not selected:
+            self.log("保存路径不能为空。")
+            return
+        try:
+            os.makedirs(selected, exist_ok=True)
+            test_file = os.path.join(selected, ".beiyang_flash_write_test")
+            with open(test_file, "wb") as f:
+                f.write(b"ok")
+            try:
+                os.remove(test_file)
+            except OSError:
+                pass
+        except Exception as exc:
+            self.log(f"无法使用该保存位置：{selected}；原因：{exc}")
+            self.set_status("保存位置不可写", COLORS["warning"])
+            return
+
+        self.save_dir = selected
+        self.save_label.text = f"保存位置：{self.save_dir}"
+        self.log(f"保存位置已设置为：{self.save_dir}")
+        if popup:
+            popup.dismiss()
 
     @mainthread
     def on_native_file_selected(self, selection):
@@ -928,9 +1031,17 @@ class FileTransferApp(App):
         except Exception as exc:
             self.set_status("发送失败", COLORS["danger"])
             self.log(f"发送失败：{exc}")
+            self.log(self.connection_help_text())
         finally:
             self.close_sockets()
             self.cleanup_temp_zip()
+
+    def connection_help_text(self):
+        return (
+            "连接提示：如果热点/家用路由器可以传、校园网不能传，通常是校园网开启了“客户端隔离”或阻止入站 TCP。"
+            "请确认两台设备连接同一个 Wi‑Fi、关闭发送方移动数据干扰，输入接收方当前 Wi‑Fi IP；"
+            "若仍失败，请用一台手机开热点，或连接同一个不隔离的局域网。"
+        )
 
     def make_zip(self, file_path):
         source = Path(file_path)
