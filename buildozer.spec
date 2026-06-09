@@ -13,8 +13,9 @@ fullscreen = 0
 # Android needs network permission for socket communication.
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES,READ_MEDIA_VIDEO,READ_MEDIA_AUDIO,MANAGE_EXTERNAL_STORAGE
 android.api = 35
-android.minapi = 23
-android.archs = arm64-v8a, armeabi-v7a
+android.minapi = 24
+android.ndk_api = 24
+android.archs = arm64-v8a
 android.accept_sdk_license = True
 
 [buildozer]
