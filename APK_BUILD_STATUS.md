@@ -6,7 +6,8 @@
 
 本项目已经提供：
 
-- `main.py`：新版精美 UI + 完整文件速传功能。
+- `main.py`：北洋闪传新版精美 UI + 完整文件速传功能。
+- `main.py`：电脑端默认启动北洋闪传网页控制台，操作步骤与手机端一致，支持 TCP 直连发送/接收、保存目录设置和 SHA-256 校验。
 - `buildozer.spec`：Android APK 打包配置。
 - `build_apk_linux.sh`：Linux / WSL 下的一键构建脚本。
 - `.github/workflows/build-apk.yml`：GitHub Actions 云端 APK 构建流程。
