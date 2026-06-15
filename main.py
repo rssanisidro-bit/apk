@@ -37,7 +37,8 @@ from kivy.uix.textinput import TextInput
 PORT = 50022
 WEB_CONTROL_PORT = 50023
 CHUNK_SIZE = 64 * 1024
-SOCKET_TIMEOUT = 15.0
+SOCKET_TIMEOUT = 20.0
+TRANSFER_TIMEOUT = 90.0
 VERIFY_TIMEOUT = 300.0
 WEB_CHUNK_SIZE = 1024 * 1024
 
@@ -100,6 +101,23 @@ def first_existing_path(candidates):
     return str(Path.home())
 
 
+def writable_directory(candidate):
+    if not candidate:
+        return False
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        probe = os.path.join(candidate, ".beiyang_flash_write_test")
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def default_file_path():
     if platform == "android":
         return first_existing_path(
@@ -116,14 +134,7 @@ def default_file_path():
 
 def default_save_path():
     if platform == "android":
-        return android_app_external_files_path() or first_existing_path(
-            [
-                "/storage/emulated/0/Download",
-                "/storage/emulated/0/Downloads",
-                "/storage/emulated/0/Documents",
-                "/storage/emulated/0",
-            ]
-        )
+        return "/storage/emulated/0/Download/北洋闪传"
     return str(Path.home() / "Downloads")
 
 
@@ -144,16 +155,15 @@ def android_app_external_files_path():
 
 
 def android_save_choices():
-    choices = []
-    app_path = android_app_external_files_path()
-    if app_path:
-        choices.append(("应用专用目录（最稳）", app_path))
-    choices.extend([
-        ("下载/北洋闪传", "/storage/emulated/0/Download/北洋闪传"),
+    choices = [
+        ("下载/北洋闪传（推荐）", "/storage/emulated/0/Download/北洋闪传"),
         ("文档/北洋闪传", "/storage/emulated/0/Documents/北洋闪传"),
         ("相册/北洋闪传", "/storage/emulated/0/DCIM/北洋闪传"),
         ("下载根目录", "/storage/emulated/0/Download"),
-    ])
+    ]
+    app_path = android_app_external_files_path()
+    if app_path:
+        choices.append(("应用专用目录（最稳但可能隐藏）", app_path))
     return choices
 
 
@@ -198,6 +208,54 @@ def copy_android_content_uri(uri):
         return target
     except Exception as exc:
         raise OSError(f"无法读取系统选择的文件：{exc}") from exc
+
+
+def android_scan_file(path):
+    if platform != "android":
+        return False
+    try:
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        MediaScannerConnection = autoclass("android.media.MediaScannerConnection")
+        activity = PythonActivity.mActivity
+        try:
+            MediaScannerConnection.scanFile(activity, [str(path)], None, None)
+            return True
+        except Exception:
+            pass
+
+        Intent = autoclass("android.content.Intent")
+        Uri = autoclass("android.net.Uri")
+        JavaFile = autoclass("java.io.File")
+        intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+        intent.setData(Uri.fromFile(JavaFile(str(path))))
+        activity.sendBroadcast(intent)
+        return True
+    except Exception:
+        return False
+
+
+def android_scan_saved_path(path):
+    if platform != "android":
+        return False
+    target = Path(path)
+    paths = []
+    if target.is_dir():
+        for item in target.rglob("*"):
+            if item.is_file():
+                paths.append(item)
+    elif target.exists():
+        paths.append(target)
+    scanned = False
+    for item in paths:
+        scanned = android_scan_file(item) or scanned
+    return scanned
+
+
+def android_path_may_be_hidden(path):
+    normalized = str(path).replace("\\", "/")
+    return platform == "android" and "/Android/data/" in normalized
 
 
 def recvall(sock, size):
@@ -438,6 +496,7 @@ class FileTransferApp(App):
         Window.clearcolor = COLORS["bg"]
         request_android_storage_permissions()
         self.cancel_event = threading.Event()
+        self.transfer_lock = threading.Lock()
         self.server_sock = None
         self.active_sock = None
         self.selected_file = None
@@ -614,6 +673,13 @@ class FileTransferApp(App):
         options.add_widget(self.make_option("发送前压缩 ZIP", self.compress_box))
         options.add_widget(self.make_option("接收后自动解压", self.unzip_box))
         card.add_widget(options)
+
+        save_hint = MutedLabel(
+            text="手机端建议保存到“下载/北洋闪传”。若保存到 Android/data，部分文件管理器会隐藏。",
+            size_hint_y=None,
+            height=dp(38),
+        )
+        card.add_widget(save_hint)
         return card
 
     def make_option(self, text, checkbox):
@@ -770,7 +836,7 @@ class FileTransferApp(App):
         )
         panel.add_widget(
             MutedLabel(
-                text="优先选择可写目录。程序会先测试写入权限，再开始接收文件。",
+                text="推荐选择“下载/北洋闪传”，保存后会主动刷新文件管理器索引。",
                 size_hint_y=None,
                 height=dp(42),
             )
@@ -842,6 +908,22 @@ class FileTransferApp(App):
         self.log(f"保存位置已设置为：{self.save_dir}")
         if popup:
             popup.dismiss()
+
+    def ensure_receive_save_dir(self):
+        if writable_directory(self.save_dir):
+            return self.save_dir
+        if platform == "android":
+            fallback = android_app_external_files_path()
+            if fallback and writable_directory(fallback):
+                self.save_dir = fallback
+                self.update_save_dir_label()
+                self.log("原保存位置不可写，已临时切换到应用专用目录。若文件管理器看不到，请改选“下载/北洋闪传”并确认权限。")
+                return self.save_dir
+        raise OSError(f"保存位置不可写：{self.save_dir}")
+
+    @mainthread
+    def update_save_dir_label(self):
+        self.save_label.text = f"保存位置：{self.save_dir}"
 
     @mainthread
     def on_native_file_selected(self, selection):
@@ -927,6 +1009,9 @@ class FileTransferApp(App):
         self.log("已发出取消请求。再次传输同一文件会尝试断点续传。")
 
     def receiver_worker(self):
+        if not self.transfer_lock.acquire(blocking=False):
+            self.log("已有传输正在进行，请先取消或等待完成。")
+            return
         try:
             self.reset_transfer_ui()
             self.set_status(f"监听中 0.0.0.0:{PORT}", COLORS["primary"])
@@ -941,12 +1026,14 @@ class FileTransferApp(App):
             self.log(f"已连接发送方：{addr[0]}")
 
             meta = recv_json(conn)
+            conn.settimeout(TRANSFER_TIMEOUT)
             filename = meta["filename"]
             total_size = int(meta["size"])
             digest = meta["sha256"]
             compressed = bool(meta.get("compressed"))
 
-            final_path = unique_path(self.save_dir, filename)
+            receive_dir = self.ensure_receive_save_dir()
+            final_path = unique_path(receive_dir, filename)
             part_path = Path(str(final_path) + ".part")
             state_path = Path(str(final_path) + ".state.json")
             offset = 0
@@ -980,6 +1067,8 @@ class FileTransferApp(App):
                     f.write(chunk)
                     bytes_received += len(chunk)
                     self.show_progress(bytes_received, total_size, f"接收 {filename}")
+                f.flush()
+                os.fsync(f.fileno())
 
             self.set_status("正在校验 SHA-256", COLORS["primary"])
             self.log("正在校验文件签名...")
@@ -995,19 +1084,32 @@ class FileTransferApp(App):
             self.show_progress(total_size, total_size, f"完成 {filename}")
             self.set_status("接收完成，校验通过", COLORS["success"])
             self.log(f"接收完成并已保存：{final_path}")
+            if android_scan_saved_path(final_path):
+                self.log("已通知 Android 刷新文件索引，文件管理器应能更快看到。")
+            if android_path_may_be_hidden(final_path):
+                self.log("当前保存位置属于 Android/data，部分手机文件管理器会隐藏；建议改用“下载/北洋闪传”。")
 
             if compressed and self.unzip_box.active:
-                self.unzip_received(final_path)
+                extract_dir = self.unzip_received(final_path)
+                if extract_dir and android_scan_saved_path(extract_dir):
+                    self.log("已刷新解压目录的文件索引。")
         except InterruptedError:
             self.set_status("接收已取消", COLORS["warning"])
             self.log("接收已取消，断点文件已保留。")
         except Exception as exc:
             self.set_status("接收失败", COLORS["danger"])
-            self.log(f"接收失败：{exc}")
+            if isinstance(exc, socket.timeout):
+                self.log(f"接收失败：{int(TRANSFER_TIMEOUT)} 秒内没有收到数据，已保留断点文件，可重新发送继续。")
+            else:
+                self.log(f"接收失败：{exc}")
         finally:
             self.close_sockets()
+            self.transfer_lock.release()
 
     def sender_worker(self):
+        if not self.transfer_lock.acquire(blocking=False):
+            self.log("已有传输正在进行，请先取消或等待完成。")
+            return
         send_path = self.selected_file
         try:
             self.reset_transfer_ui()
@@ -1047,6 +1149,7 @@ class FileTransferApp(App):
                 return
 
             offset = int(reply.get("offset", 0))
+            sock.settimeout(TRANSFER_TIMEOUT)
             self.begin_meter(offset)
             self.log(f"开始发送：{filename}，从 {format_bytes(offset)} 处继续。")
             bytes_sent = offset
@@ -1076,11 +1179,15 @@ class FileTransferApp(App):
             self.log("发送已取消。")
         except Exception as exc:
             self.set_status("发送失败", COLORS["danger"])
-            self.log(f"发送失败：{exc}")
+            if isinstance(exc, socket.timeout):
+                self.log(f"发送失败：网络长时间无响应。可重新点击发送，程序会尝试断点续传。")
+            else:
+                self.log(f"发送失败：{exc}")
             self.log(self.connection_help_text())
         finally:
             self.close_sockets()
             self.cleanup_temp_zip()
+            self.transfer_lock.release()
 
     def connection_help_text(self):
         return (
@@ -1105,8 +1212,10 @@ class FileTransferApp(App):
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(extract_dir)
             self.log(f"已自动解压到：{extract_dir}")
+            return extract_dir
         except Exception as exc:
             self.log(f"自动解压失败：{exc}")
+            return None
 
     def cleanup_temp_zip(self):
         if self.temp_zip:
@@ -2726,6 +2835,7 @@ def desktop_receive_worker(state, auto_unzip=True):
         state.log(f"已连接发送方：{addr[0]}")
 
         meta = recv_json(conn)
+        conn.settimeout(TRANSFER_TIMEOUT)
         filename = safe_filename(meta["filename"])
         total_size = int(meta["size"])
         digest = meta["sha256"]
@@ -2762,6 +2872,8 @@ def desktop_receive_worker(state, auto_unzip=True):
                 f.write(chunk)
                 bytes_received += len(chunk)
                 state.update_progress(bytes_received, total_size, f"接收 {filename}")
+            f.flush()
+            os.fsync(f.fileno())
 
         state.set_status("正在校验 SHA-256")
         actual_digest, _ = sha256_file(part_path, state.cancel_event)
@@ -2785,7 +2897,10 @@ def desktop_receive_worker(state, auto_unzip=True):
         state.log("接收已取消，断点文件已保留。")
     except Exception as exc:
         state.set_status("接收失败", mode="idle", busy=False)
-        state.log(f"接收失败：{exc}")
+        if isinstance(exc, socket.timeout):
+            state.log(f"接收失败：{int(TRANSFER_TIMEOUT)} 秒内没有收到数据，断点文件已保留，可重新发送继续。")
+        else:
+            state.log(f"接收失败：{exc}")
     finally:
         state.close_sockets()
         with state.lock:
@@ -2839,6 +2954,7 @@ def desktop_send_worker(state, target_text, compress=False):
         if not reply.get("ok"):
             raise ConnectionError("接收方拒绝了文件")
         offset = int(reply.get("offset", 0))
+        sock.settimeout(TRANSFER_TIMEOUT)
         state.begin_meter(offset)
         state.log(f"开始发送：{filename}，从 {format_bytes(offset)} 处继续。")
         bytes_sent = offset
@@ -2866,7 +2982,10 @@ def desktop_send_worker(state, target_text, compress=False):
         state.log("发送已取消。")
     except Exception as exc:
         state.set_status("发送失败", mode="idle", busy=False)
-        state.log(f"发送失败：{exc}")
+        if isinstance(exc, socket.timeout):
+            state.log("发送失败：网络长时间无响应。可重新发送，程序会尝试断点续传。")
+        else:
+            state.log(f"发送失败：{exc}")
         state.log(
             "连接提示：若热点可传但校园网不能传，通常是校园网客户端隔离或阻止入站 TCP。"
             "请换手机热点或同一不隔离局域网。"

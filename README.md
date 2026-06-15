@@ -15,21 +15,29 @@
 - 双方都可以取消当前传输。
 - 支持断点续传：未完成内容保存为 `.part`，状态保存为 `.state.json`。
 - 支持 SHA-256 文件签名校验，校验通过后才生成最终文件。
-- 已增强 TCP keepalive、传输缓冲区和校验等待时间，减少大文件或慢网络下误判失败。
+- 已增强 TCP keepalive、传输缓冲区、传输阶段超时和校验等待时间，减少大文件或慢网络下误判失败。
+- Android 接收完成后会主动刷新系统文件索引，让文件管理器更快显示新文件。
 - 支持手机和桌面运行，适合同一局域网内面对面同时在线直传。
 
 ## Android 保存位置
 
-Android 系统对文件夹选择有权限限制，Kivy 内置文件夹选择器在部分手机上会显示异常或无法进入真实目录。因此本项目在 Android 上使用专门的保存位置面板。默认保存到应用专用目录，这是 Android 权限限制下最稳定的选择：
+Android 系统对文件夹选择和文件索引有权限限制，Kivy 内置文件夹选择器在部分手机上会显示异常或无法进入真实目录。因此本项目在 Android 上使用专门的保存位置面板。新版默认优先保存到公共下载目录，方便在文件管理器中找到：
 
-- 应用专用目录（最稳）：`/storage/emulated/0/Android/data/org.tju.challenge.beiyangflashtransfer/files/北洋闪传`
-- 下载/北洋闪传：`/storage/emulated/0/Download/北洋闪传`
+- 下载/北洋闪传（推荐）：`/storage/emulated/0/Download/北洋闪传`
 - 文档/北洋闪传：`/storage/emulated/0/Documents/北洋闪传`
 - 相册/北洋闪传：`/storage/emulated/0/DCIM/北洋闪传`
 - 下载根目录：`/storage/emulated/0/Download`
+- 应用专用目录（最稳但可能隐藏）：`/storage/emulated/0/Android/data/org.tju.challenge.beiyangflashtransfer/files/北洋闪传`
 - 手动路径：可自行输入可写路径
 
 点击保存位置后，程序会尝试创建目录并写入一个临时测试文件。如果该目录不可写，会在运行记录中提示错误，避免传输完成后才发现保存失败。
+
+接收完成后，程序会执行两件事：
+
+- 强制把接收到的文件写入磁盘，降低“显示完成但文件还没落盘”的概率。
+- 通知 Android 刷新媒体/文件索引，让文件管理器更快看到文件。
+
+如果你选择了 `Android/data/...` 这类应用专用目录，部分 Android 11+ 手机的系统文件管理器会隐藏这个目录，这是系统限制，不是传输失败。建议优先使用“下载/北洋闪传”。
 
 ## 使用流程
 
