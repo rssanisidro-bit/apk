@@ -44,6 +44,7 @@ WEB_CHUNK_SIZE = 1024 * 1024
 APP_SETTINGS_FILENAME = "beiyang_flash_settings.json"
 SEND_CONNECT_ATTEMPTS = 3
 ANDROID_FILE_PICK_REQUEST = 50024
+ANDROID_SAFE_UPLOAD_PORT = 50025
 
 COLORS = {
     "bg": (0.95, 0.98, 1.0, 1),
@@ -262,6 +263,52 @@ def copy_android_content_uri(uri):
                 stream.close()
             except Exception:
                 pass
+
+
+def prepare_android_content_fd(uri):
+    if platform != "android":
+        raise OSError("仅 Android 支持 content:// 文件描述符读取")
+    from jnius import autoclass
+
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    Uri = autoclass("android.net.Uri")
+    Intent = autoclass("android.content.Intent")
+    OpenableColumns = autoclass("android.provider.OpenableColumns")
+
+    activity = PythonActivity.mActivity
+    resolver = activity.getContentResolver()
+    parsed_uri = Uri.parse(str(uri))
+    filename = "selected_file"
+
+    try:
+        resolver.takePersistableUriPermission(parsed_uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    except Exception:
+        pass
+
+    cursor = None
+    try:
+        cursor = resolver.query(parsed_uri, None, None, None, None)
+        if cursor:
+            name_index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if name_index >= 0 and cursor.moveToFirst():
+                filename = cursor.getString(name_index) or filename
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    target = unique_path(tempfile.gettempdir(), safe_filename(filename))
+    pfd = resolver.openFileDescriptor(parsed_uri, "r")
+    if pfd is None:
+        raise OSError("系统没有提供可读取的文件描述符")
+    fd = pfd.detachFd()
+    if fd < 0:
+        raise OSError("系统返回的文件描述符无效")
+    return fd, str(target)
 
 
 def android_scan_file(path):
@@ -574,6 +621,8 @@ class FileTransferApp(App):
         self.transfer_lock = threading.Lock()
         self.server_sock = None
         self.active_sock = None
+        self.android_upload_server = None
+        self.android_upload_thread = None
         self.selected_file = None
         self.settings = load_app_settings()
         configured_save_dir = self.settings.get("save_dir")
@@ -760,9 +809,9 @@ class FileTransferApp(App):
         card.add_widget(options)
 
         save_hint = MutedLabel(
-            text="手机端建议保存到“下载/北洋闪传”。若保存到 Android/data，部分文件管理器会隐藏。",
+            text="手机端选择 PDF/Word 会打开文档安全选择页；选好后返回 App 即可发送。接收建议保存到“下载/北洋闪传”。",
             size_hint_y=None,
-            height=dp(38),
+            height=dp(52),
         )
         card.add_widget(save_hint)
         return card
@@ -878,23 +927,9 @@ class FileTransferApp(App):
 
     def open_file_picker(self):
         if platform == "android":
-            if self.open_android_document_picker():
+            if self.open_android_safe_upload_picker():
                 return
-            try:
-                from plyer import filechooser
-
-                try:
-                    filechooser.open_file(
-                        on_selection=self.on_native_file_selected,
-                        filters=["*/*"],
-                        multiple=False,
-                    )
-                except TypeError:
-                    filechooser.open_file(on_selection=self.on_native_file_selected)
-                self.log("已打开系统文件选择器，可选择图片、PDF、文档或压缩包。")
-                return
-            except Exception as exc:
-                self.log(f"系统文件选择器不可用，改用内置选择器：{exc}")
+            self.log("文档安全选择页不可用，已改用内置稳定选择器。若看不到文档，请把文件放到 Download 或 Documents 后再选。")
 
         chooser = FileChooserIconView(path=default_file_path())
         popup = self.make_picker_popup("选择要发送的文件", chooser)
@@ -909,6 +944,46 @@ class FileTransferApp(App):
 
         popup.ok_button.bind(on_press=choose)
         popup.open()
+
+    def ensure_android_safe_upload_server(self):
+        if self.android_upload_server:
+            return self.android_upload_server.server_port
+        last_error = None
+        for port in (ANDROID_SAFE_UPLOAD_PORT, 50125, 50126, 50127):
+            try:
+                handler = create_android_safe_upload_handler(self)
+                server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                self.android_upload_server = server
+                self.android_upload_thread = thread
+                self.log(f"文档安全选择服务已启动：127.0.0.1:{server.server_port}")
+                return server.server_port
+            except OSError as exc:
+                last_error = exc
+        raise OSError(f"无法启动文档安全选择服务：{last_error}")
+
+    def open_android_safe_upload_picker(self):
+        try:
+            port = self.ensure_android_safe_upload_server()
+            url = f"http://127.0.0.1:{port}/"
+            try:
+                from jnius import autoclass
+
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                activity = PythonActivity.mActivity
+                intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                activity.startActivity(intent)
+            except Exception:
+                webbrowser.open(url)
+            self.log("已打开文档安全选择页。请选择 PDF/Word 后点“使用这个文件”，再回到 App 发送。")
+            self.set_status("等待文档安全选择", COLORS["primary"])
+            return True
+        except Exception as exc:
+            self.log(f"文档安全选择页不可用：{exc}")
+            return False
 
     def open_android_document_picker(self):
         try:
@@ -1103,16 +1178,48 @@ class FileTransferApp(App):
             selected = str(selected)
             self.set_status("正在读取所选文件", COLORS["primary"])
             self.log("正在读取所选文件，请稍候...")
+            if platform == "android" and selected.startswith("content://"):
+                try:
+                    fd, target = prepare_android_content_fd(selected)
+                except Exception as exc:
+                    self.on_file_selection_failed(f"无法读取系统文档：{exc}")
+                    return
+                threading.Thread(target=self.copy_detached_fd_worker, args=(fd, target), daemon=True).start()
+                return
             threading.Thread(target=self.resolve_selected_file_worker, args=(selected,), daemon=True).start()
         except Exception as exc:
             self.on_file_selection_failed(f"文件选择失败：{exc}")
+
+    def copy_detached_fd_worker(self, fd, target):
+        close_manually = True
+        try:
+            with os.fdopen(fd, "rb", closefd=True) as source, open(target, "wb") as out:
+                close_manually = False
+                while True:
+                    chunk = source.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            if not os.path.isfile(target) or os.path.getsize(target) <= 0:
+                raise OSError("所选文档为空或无法复制")
+            self.apply_selected_file(target, True)
+        except Exception as exc:
+            self.on_file_selection_failed(f"文档读取失败：{exc}")
+        finally:
+            if close_manually:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def resolve_selected_file_worker(self, selected):
         try:
             selected = str(selected)
             copied_from_uri = selected.startswith("content://")
             if copied_from_uri:
-                selected = copy_android_content_uri(selected)
+                raise OSError("文档 URI 未能准备为可读取文件，请改用 Download 或 Documents 内置选择器")
             if not os.path.isfile(selected):
                 raise OSError(f"未能读取所选文件：{selected}")
             self.apply_selected_file(selected, copied_from_uri)
@@ -1425,6 +1532,20 @@ class FileTransferApp(App):
                 pass
             setattr(self, attr, None)
 
+    def on_stop(self):
+        self.close_sockets()
+        server = self.android_upload_server
+        self.android_upload_server = None
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+
     @mainthread
     def begin_meter(self, offset):
         self.current_start_time = time.monotonic()
@@ -1470,6 +1591,190 @@ def safe_filename(name):
     if not cleaned or cleaned in {".", ".."}:
         cleaned = f"file_{int(time.time())}"
     return cleaned.replace("/", "_").replace("\\", "_")
+
+
+ANDROID_SAFE_UPLOAD_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北洋闪传 - 文档安全选择</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+      color: #0b1526;
+      background: #eef6ff;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }
+    main {
+      width: min(100%, 560px);
+      background: #fff;
+      border: 1px solid #d8e4f2;
+      border-radius: 10px;
+      box-shadow: 0 12px 34px rgba(18, 69, 124, .13);
+      overflow: hidden;
+    }
+    header {
+      padding: 24px 22px;
+      color: #fff;
+      background: linear-gradient(135deg, #092f63, #0f73df);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    p { margin: 0; line-height: 1.7; color: #667589; }
+    header p { color: rgba(255,255,255,.82); }
+    section { padding: 22px; }
+    input[type=file] {
+      width: 100%;
+      min-height: 54px;
+      padding: 14px;
+      border: 2px dashed #abc5df;
+      border-radius: 8px;
+      background: #f7faff;
+      font: inherit;
+    }
+    button {
+      width: 100%;
+      min-height: 50px;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 8px;
+      color: #fff;
+      background: #0f73df;
+      font: inherit;
+      font-weight: 800;
+    }
+    button:disabled { opacity: .55; }
+    .status {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #eef6ff;
+      color: #092f63;
+      min-height: 48px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>北洋闪传</h1>
+      <p>文档安全选择页</p>
+    </header>
+    <section>
+      <p>请选择 PDF、Word、压缩包或其他文档。选择后会直接传回北洋闪传 App，不经过 Kivy 原生文档读取路径。</p>
+      <input id="file" type="file">
+      <button id="upload" disabled>使用这个文件</button>
+      <div id="status" class="status">等待选择文件。</div>
+    </section>
+  </main>
+  <script>
+    const fileInput = document.getElementById("file");
+    const upload = document.getElementById("upload");
+    const statusBox = document.getElementById("status");
+    let currentFile = null;
+    function fmt(bytes) {
+      const units = ["B", "KB", "MB", "GB"];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index += 1;
+      }
+      return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    }
+    fileInput.addEventListener("change", () => {
+      currentFile = fileInput.files && fileInput.files[0];
+      upload.disabled = !currentFile;
+      statusBox.textContent = currentFile ? `已选择：${currentFile.name}（${fmt(currentFile.size)}）` : "等待选择文件。";
+    });
+    upload.addEventListener("click", async () => {
+      if (!currentFile) return;
+      upload.disabled = true;
+      statusBox.textContent = "正在交给北洋闪传 App，请稍候...";
+      try {
+        const url = `/upload?filename=${encodeURIComponent(currentFile.name)}&size=${currentFile.size}`;
+        const response = await fetch(url, {method: "POST", body: currentFile});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `上传失败：${response.status}`);
+        statusBox.textContent = `已交给北洋闪传：${data.file}。现在可以返回 App 点击“立即发送”。`;
+      } catch (error) {
+        statusBox.textContent = error.message;
+        upload.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def create_android_safe_upload_handler(app):
+    class AndroidSafeUploadHandler(BaseHTTPRequestHandler):
+        server_version = "BeiyangFlashAndroidPicker/1.0"
+
+        def log_message(self, *_):
+            return
+
+        def send_bytes(self, body, content_type="text/plain; charset=utf-8", status=200):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_json(self, payload, status=200):
+            self.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in {"/", "/index.html"}:
+                self.send_bytes(ANDROID_SAFE_UPLOAD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            self.send_json({"error": "页面不存在"}, 404)
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            try:
+                if parsed.path != "/upload":
+                    self.send_json({"error": "接口不存在"}, 404)
+                    return
+                params = urllib.parse.parse_qs(parsed.query)
+                filename = safe_filename((params.get("filename") or ["selected_file"])[0])
+                expected_size = int((params.get("size") or ["0"])[0])
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length <= 0:
+                    raise ValueError("浏览器没有传回文件内容")
+                staging_dir = Path(tempfile.gettempdir()) / "beiyang_flash_android_uploads"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                target = unique_path(staging_dir, filename)
+                received = 0
+                with open(target, "wb") as out:
+                    while received < length:
+                        chunk = self.rfile.read(min(WEB_CHUNK_SIZE, length - received))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        received += len(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if expected_size and received != expected_size:
+                    raise ValueError("读取文件不完整，请重新选择")
+                app.apply_selected_file(str(target), False)
+                app.log(f"已通过文档安全选择页读取文件：{filename} ({format_bytes(received)})")
+                self.send_json({"ok": True, "file": filename, "size": received})
+            except Exception as exc:
+                app.log(f"文档安全选择失败：{exc}")
+                self.send_json({"error": str(exc)}, 400)
+
+    return AndroidSafeUploadHandler
 
 
 def test_writable_dir(folder):
