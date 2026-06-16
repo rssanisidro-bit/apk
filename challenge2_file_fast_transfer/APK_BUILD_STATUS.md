@@ -9,7 +9,7 @@
 - `main.py`：北洋闪传新版精美 UI + 完整文件速传功能。
 - `main.py`：电脑端默认启动北洋闪传网页控制台，操作步骤与手机端一致，支持 TCP 直连发送/接收、保存目录设置和 SHA-256 校验。
 - `main.py`：已优化传输超时、连接重试、断点续传提示、接收落盘和 Android 文件索引刷新，减少发送失败和文件管理器延迟显示问题。
-- `main.py`：Android 文件选择器已支持 PDF、文档、压缩包等非图片文件；对方 IP 会自动保存，重启后继续保留。
+- `main.py`：Android 发送端已改用原生 `ACTION_OPEN_DOCUMENT` 文档选择器，并在后台读取 `content://` 文件，修复 PDF、文档、压缩包等非图片文件选择时可能闪退的问题；对方 IP 会自动保存，重启后继续保留。
 - `buildozer.spec`：Android APK 打包配置。
 - `build_apk_linux.sh`：Linux / WSL 下的一键构建脚本。
 - `.github/workflows/build-apk.yml`：GitHub Actions 云端 APK 构建流程。

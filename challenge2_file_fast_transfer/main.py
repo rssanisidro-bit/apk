@@ -43,6 +43,7 @@ VERIFY_TIMEOUT = 300.0
 WEB_CHUNK_SIZE = 1024 * 1024
 APP_SETTINGS_FILENAME = "beiyang_flash_settings.json"
 SEND_CONNECT_ATTEMPTS = 3
+ANDROID_FILE_PICK_REQUEST = 50024
 
 COLORS = {
     "bg": (0.95, 0.98, 1.0, 1),
@@ -877,6 +878,8 @@ class FileTransferApp(App):
 
     def open_file_picker(self):
         if platform == "android":
+            if self.open_android_document_picker():
+                return
             try:
                 from plyer import filechooser
 
@@ -906,6 +909,67 @@ class FileTransferApp(App):
 
         popup.ok_button.bind(on_press=choose)
         popup.open()
+
+    def open_android_document_picker(self):
+        try:
+            from android import activity as android_activity
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+            activity = PythonActivity.mActivity
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, False)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            try:
+                android_activity.unbind(on_activity_result=self.on_android_activity_result)
+            except Exception:
+                pass
+            android_activity.bind(on_activity_result=self.on_android_activity_result)
+            activity.startActivityForResult(intent, ANDROID_FILE_PICK_REQUEST)
+            self.log("已打开系统文档选择器，可选择 PDF、文档、图片或压缩包。")
+            return True
+        except Exception as exc:
+            self.log(f"原生文档选择器不可用，尝试兼容选择器：{exc}")
+            return False
+
+    def on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != ANDROID_FILE_PICK_REQUEST:
+            return
+        try:
+            from android import activity as android_activity
+            from jnius import autoclass
+
+            try:
+                android_activity.unbind(on_activity_result=self.on_android_activity_result)
+            except Exception:
+                pass
+
+            Activity = autoclass("android.app.Activity")
+            if result_code != Activity.RESULT_OK or intent is None:
+                self.log("已取消选择文件。")
+                return
+
+            uri = None
+            data = intent.getData()
+            if data:
+                uri = data.toString()
+            else:
+                clip_data = intent.getClipData()
+                if clip_data and clip_data.getItemCount() > 0:
+                    item = clip_data.getItemAt(0)
+                    if item and item.getUri():
+                        uri = item.getUri().toString()
+
+            if not uri:
+                self.on_file_selection_failed("系统没有返回可读取的文件地址")
+                return
+            self.on_native_file_selected([uri])
+        except Exception as exc:
+            self.on_file_selection_failed(f"文件选择回调失败：{exc}")
 
     def open_folder_picker(self):
         if platform == "android":
@@ -1037,25 +1101,38 @@ class FileTransferApp(App):
                 return
             selected = selection if isinstance(selection, str) else selection[0]
             selected = str(selected)
-            if selected.startswith("content://"):
-                try:
-                    selected = copy_android_content_uri(selected)
-                    self.log("已读取系统文件选择器返回的文件。")
-                except OSError as exc:
-                    self.log(str(exc))
-                    self.set_status("文件读取失败", COLORS["warning"])
-                    return
-            if os.path.isfile(selected):
-                self.selected_file = selected
-                size_text = format_bytes(os.path.getsize(self.selected_file))
-                self.file_label.text = f"待发送文件：{os.path.basename(self.selected_file)}  ({size_text})"
-                self.log(f"已选择文件：{self.selected_file}")
-            else:
-                self.log(f"未能读取所选文件：{selected}")
-                self.set_status("未能读取文件", COLORS["warning"])
+            self.set_status("正在读取所选文件", COLORS["primary"])
+            self.log("正在读取所选文件，请稍候...")
+            threading.Thread(target=self.resolve_selected_file_worker, args=(selected,), daemon=True).start()
         except Exception as exc:
-            self.log(f"文件选择失败：{exc}")
-            self.set_status("文件选择失败", COLORS["warning"])
+            self.on_file_selection_failed(f"文件选择失败：{exc}")
+
+    def resolve_selected_file_worker(self, selected):
+        try:
+            selected = str(selected)
+            copied_from_uri = selected.startswith("content://")
+            if copied_from_uri:
+                selected = copy_android_content_uri(selected)
+            if not os.path.isfile(selected):
+                raise OSError(f"未能读取所选文件：{selected}")
+            self.apply_selected_file(selected, copied_from_uri)
+        except Exception as exc:
+            self.on_file_selection_failed(str(exc))
+
+    @mainthread
+    def apply_selected_file(self, selected, copied_from_uri=False):
+        self.selected_file = selected
+        size_text = format_bytes(os.path.getsize(self.selected_file))
+        self.file_label.text = f"待发送文件：{os.path.basename(self.selected_file)}  ({size_text})"
+        self.set_status("文件已选择", COLORS["success"])
+        if copied_from_uri:
+            self.log("已读取系统文档选择器返回的文件。")
+        self.log(f"已选择文件：{self.selected_file}")
+
+    @mainthread
+    def on_file_selection_failed(self, message):
+        self.log(message)
+        self.set_status("文件选择失败", COLORS["warning"])
 
     @mainthread
     def on_native_folder_selected(self, selection):
