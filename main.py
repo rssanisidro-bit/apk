@@ -38,9 +38,13 @@ PORT = 50022
 WEB_CONTROL_PORT = 50023
 CHUNK_SIZE = 64 * 1024
 SOCKET_TIMEOUT = 20.0
-TRANSFER_TIMEOUT = 90.0
+TRANSFER_TIMEOUT = 180.0
 VERIFY_TIMEOUT = 300.0
 WEB_CHUNK_SIZE = 1024 * 1024
+APP_SETTINGS_FILENAME = "beiyang_flash_settings.json"
+SEND_CONNECT_ATTEMPTS = 3
+ANDROID_FILE_PICK_REQUEST = 50024
+ANDROID_SAFE_UPLOAD_PORT = 50025
 
 COLORS = {
     "bg": (0.95, 0.98, 1.0, 1),
@@ -167,20 +171,61 @@ def android_save_choices():
     return choices
 
 
+def app_settings_path():
+    if platform == "android":
+        try:
+            from android.storage import app_storage_path
+
+            return Path(app_storage_path()) / APP_SETTINGS_FILENAME
+        except Exception:
+            pass
+    return Path.cwd() / APP_SETTINGS_FILENAME
+
+
+def load_app_settings():
+    try:
+        path = app_settings_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_app_settings(settings):
+    try:
+        path = app_settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+
+
 def copy_android_content_uri(uri):
+    uri = str(uri)
     if platform != "android" or not uri.startswith("content://"):
         return uri
+    stream = None
     try:
         from jnius import autoclass, jarray
 
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         Uri = autoclass("android.net.Uri")
+        Intent = autoclass("android.content.Intent")
         OpenableColumns = autoclass("android.provider.OpenableColumns")
 
         activity = PythonActivity.mActivity
         resolver = activity.getContentResolver()
         parsed_uri = Uri.parse(uri)
         filename = "selected_file"
+        try:
+            resolver.takePersistableUriPermission(parsed_uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        except Exception:
+            pass
 
         cursor = resolver.query(parsed_uri, None, None, None, None)
         if cursor:
@@ -191,8 +236,8 @@ def copy_android_content_uri(uri):
             finally:
                 cursor.close()
 
-        safe_name = os.path.basename(filename).replace("/", "_").replace("\\", "_")
-        target = os.path.join(tempfile.gettempdir(), safe_name)
+        safe_name = safe_filename(filename)
+        target = unique_path(tempfile.gettempdir(), safe_name)
         stream = resolver.openInputStream(parsed_uri)
         if stream is None:
             raise OSError("无法打开系统文件流")
@@ -200,14 +245,70 @@ def copy_android_content_uri(uri):
         with open(target, "wb") as out:
             buffer = jarray("b")(64 * 1024)
             while True:
-                read = stream.read(buffer)
-                if read == -1:
+                count = stream.read(buffer)
+                if count == -1:
                     break
-                out.write(bytes((value & 0xFF for value in buffer[:read])))
-        stream.close()
-        return target
+                if count <= 0:
+                    continue
+                chunk = bytearray(count)
+                for index in range(count):
+                    chunk[index] = buffer[index] & 0xFF
+                out.write(chunk)
+        return str(target)
     except Exception as exc:
         raise OSError(f"无法读取系统选择的文件：{exc}") from exc
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def prepare_android_content_fd(uri):
+    if platform != "android":
+        raise OSError("仅 Android 支持 content:// 文件描述符读取")
+    from jnius import autoclass
+
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    Uri = autoclass("android.net.Uri")
+    Intent = autoclass("android.content.Intent")
+    OpenableColumns = autoclass("android.provider.OpenableColumns")
+
+    activity = PythonActivity.mActivity
+    resolver = activity.getContentResolver()
+    parsed_uri = Uri.parse(str(uri))
+    filename = "selected_file"
+
+    try:
+        resolver.takePersistableUriPermission(parsed_uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    except Exception:
+        pass
+
+    cursor = None
+    try:
+        cursor = resolver.query(parsed_uri, None, None, None, None)
+        if cursor:
+            name_index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if name_index >= 0 and cursor.moveToFirst():
+                filename = cursor.getString(name_index) or filename
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    target = unique_path(tempfile.gettempdir(), safe_filename(filename))
+    pfd = resolver.openFileDescriptor(parsed_uri, "r")
+    if pfd is None:
+        raise OSError("系统没有提供可读取的文件描述符")
+    fd = pfd.detachFd()
+    if fd < 0:
+        raise OSError("系统返回的文件描述符无效")
+    return fd, str(target)
 
 
 def android_scan_file(path):
@@ -294,6 +395,27 @@ def tune_transfer_socket(sock):
         except OSError:
             pass
     return sock
+
+
+def connect_tcp_with_retries(host, port, logger=None, attempts=SEND_CONNECT_ATTEMPTS):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        sock = tune_transfer_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        sock.settimeout(SOCKET_TIMEOUT)
+        try:
+            sock.connect((host, port))
+            return sock
+        except OSError as exc:
+            last_error = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if attempt < attempts:
+                if logger:
+                    logger(f"连接失败（第 {attempt} 次）：{exc}，正在重试...")
+                time.sleep(0.8)
+    raise ConnectionError(f"无法连接 {host}:{port}：{last_error}")
 
 
 def sha256_file(path, stop_event=None):
@@ -499,12 +621,20 @@ class FileTransferApp(App):
         self.transfer_lock = threading.Lock()
         self.server_sock = None
         self.active_sock = None
+        self.android_upload_server = None
+        self.android_upload_thread = None
         self.selected_file = None
-        self.save_dir = default_save_path()
+        self.settings = load_app_settings()
+        configured_save_dir = self.settings.get("save_dir")
+        self.save_dir = configured_save_dir or default_save_path()
         try:
             os.makedirs(self.save_dir, exist_ok=True)
         except OSError:
-            pass
+            self.save_dir = default_save_path()
+            try:
+                os.makedirs(self.save_dir, exist_ok=True)
+            except OSError:
+                pass
         self.temp_zip = None
         self.local_ips = get_local_ips()
         self.current_start_time = None
@@ -600,7 +730,11 @@ class FileTransferApp(App):
 
         row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
         row.add_widget(Pill(text="对方 IP", bg_color=COLORS["cyan_soft"], size_hint_x=0.28))
-        self.ip_input = ModernTextInput(text="127.0.0.1", hint_text="例如 192.168.1.23")
+        self.ip_input = ModernTextInput(
+            text=self.settings.get("peer_ip", "127.0.0.1"),
+            hint_text="例如 192.168.1.23",
+        )
+        self.ip_input.bind(text=self.on_peer_ip_changed)
         row.add_widget(self.ip_input)
         card.add_widget(row)
 
@@ -619,9 +753,9 @@ class FileTransferApp(App):
         card.add_widget(actions)
 
         note = MutedLabel(
-            text="两台设备需在同一 Wi-Fi、热点或不隔离的局域网内。",
+            text="上次输入的对方 IP 会自动保存；两台设备需在同一 Wi-Fi、热点或不隔离的局域网内。",
             size_hint_y=None,
-            height=dp(38),
+            height=dp(46),
         )
         card.add_widget(note)
         return card
@@ -675,9 +809,9 @@ class FileTransferApp(App):
         card.add_widget(options)
 
         save_hint = MutedLabel(
-            text="手机端建议保存到“下载/北洋闪传”。若保存到 Android/data，部分文件管理器会隐藏。",
+            text="手机端选择 PDF/Word 会打开文档安全选择页；选好后返回 App 即可发送。接收建议保存到“下载/北洋闪传”。",
             size_hint_y=None,
-            height=dp(38),
+            height=dp(52),
         )
         card.add_widget(save_hint)
         return card
@@ -779,16 +913,23 @@ class FileTransferApp(App):
         self.local_ip_label.text = f"我的 IP：{' / '.join(self.local_ips)}"
         self.log("已刷新本机 IP。")
 
+    def persist_setting(self, key, value):
+        self.settings[key] = value
+        save_app_settings(self.settings)
+
+    def persist_peer_ip(self, value):
+        value = (value or "").strip()
+        if value:
+            self.persist_setting("peer_ip", value)
+
+    def on_peer_ip_changed(self, _instance, value):
+        self.persist_peer_ip(value)
+
     def open_file_picker(self):
         if platform == "android":
-            try:
-                from plyer import filechooser
-
-                filechooser.open_file(on_selection=self.on_native_file_selected)
-                self.log("已打开系统文件选择器。")
+            if self.open_android_safe_upload_picker():
                 return
-            except Exception as exc:
-                self.log(f"系统文件选择器不可用，改用内置选择器：{exc}")
+            self.log("文档安全选择页不可用，已改用内置稳定选择器。若看不到文档，请把文件放到 Download 或 Documents 后再选。")
 
         chooser = FileChooserIconView(path=default_file_path())
         popup = self.make_picker_popup("选择要发送的文件", chooser)
@@ -804,6 +945,107 @@ class FileTransferApp(App):
         popup.ok_button.bind(on_press=choose)
         popup.open()
 
+    def ensure_android_safe_upload_server(self):
+        if self.android_upload_server:
+            return self.android_upload_server.server_port
+        last_error = None
+        for port in (ANDROID_SAFE_UPLOAD_PORT, 50125, 50126, 50127):
+            try:
+                handler = create_android_safe_upload_handler(self)
+                server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                self.android_upload_server = server
+                self.android_upload_thread = thread
+                self.log(f"文档安全选择服务已启动：127.0.0.1:{server.server_port}")
+                return server.server_port
+            except OSError as exc:
+                last_error = exc
+        raise OSError(f"无法启动文档安全选择服务：{last_error}")
+
+    def open_android_safe_upload_picker(self):
+        try:
+            port = self.ensure_android_safe_upload_server()
+            url = f"http://127.0.0.1:{port}/"
+            try:
+                from jnius import autoclass
+
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                activity = PythonActivity.mActivity
+                intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                activity.startActivity(intent)
+            except Exception:
+                webbrowser.open(url)
+            self.log("已打开文档安全选择页。请选择 PDF/Word 后点“使用这个文件”，再回到 App 发送。")
+            self.set_status("等待文档安全选择", COLORS["primary"])
+            return True
+        except Exception as exc:
+            self.log(f"文档安全选择页不可用：{exc}")
+            return False
+
+    def open_android_document_picker(self):
+        try:
+            from android import activity as android_activity
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+            activity = PythonActivity.mActivity
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, False)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            try:
+                android_activity.unbind(on_activity_result=self.on_android_activity_result)
+            except Exception:
+                pass
+            android_activity.bind(on_activity_result=self.on_android_activity_result)
+            activity.startActivityForResult(intent, ANDROID_FILE_PICK_REQUEST)
+            self.log("已打开系统文档选择器，可选择 PDF、文档、图片或压缩包。")
+            return True
+        except Exception as exc:
+            self.log(f"原生文档选择器不可用，尝试兼容选择器：{exc}")
+            return False
+
+    def on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != ANDROID_FILE_PICK_REQUEST:
+            return
+        try:
+            from android import activity as android_activity
+            from jnius import autoclass
+
+            try:
+                android_activity.unbind(on_activity_result=self.on_android_activity_result)
+            except Exception:
+                pass
+
+            Activity = autoclass("android.app.Activity")
+            if result_code != Activity.RESULT_OK or intent is None:
+                self.log("已取消选择文件。")
+                return
+
+            uri = None
+            data = intent.getData()
+            if data:
+                uri = data.toString()
+            else:
+                clip_data = intent.getClipData()
+                if clip_data and clip_data.getItemCount() > 0:
+                    item = clip_data.getItemAt(0)
+                    if item and item.getUri():
+                        uri = item.getUri().toString()
+
+            if not uri:
+                self.on_file_selection_failed("系统没有返回可读取的文件地址")
+                return
+            self.on_native_file_selected([uri])
+        except Exception as exc:
+            self.on_file_selection_failed(f"文件选择回调失败：{exc}")
+
     def open_folder_picker(self):
         if platform == "android":
             self.open_android_save_picker()
@@ -817,6 +1059,7 @@ class FileTransferApp(App):
             if os.path.isdir(selected):
                 self.save_dir = selected
                 self.save_label.text = f"保存位置：{self.save_dir}"
+                self.persist_setting("save_dir", self.save_dir)
                 self.log(f"保存位置已设置为：{self.save_dir}")
                 popup.dismiss()
 
@@ -905,6 +1148,7 @@ class FileTransferApp(App):
 
         self.save_dir = selected
         self.save_label.text = f"保存位置：{self.save_dir}"
+        self.persist_setting("save_dir", self.save_dir)
         self.log(f"保存位置已设置为：{self.save_dir}")
         if popup:
             popup.dismiss()
@@ -927,35 +1171,88 @@ class FileTransferApp(App):
 
     @mainthread
     def on_native_file_selected(self, selection):
-        if not selection:
-            return
-        selected = selection[0]
-        if selected.startswith("content://"):
-            try:
-                selected = copy_android_content_uri(selected)
-                self.log("已读取系统文件选择器返回的文件。")
-            except OSError as exc:
-                self.log(str(exc))
+        try:
+            if not selection:
                 return
-        if os.path.isfile(selected):
-            self.selected_file = selected
-            size_text = format_bytes(os.path.getsize(self.selected_file))
-            self.file_label.text = f"待发送文件：{os.path.basename(self.selected_file)}  ({size_text})"
-            self.log(f"已选择文件：{self.selected_file}")
-        else:
-            self.log(f"未能读取所选文件：{selected}")
+            selected = selection if isinstance(selection, str) else selection[0]
+            selected = str(selected)
+            self.set_status("正在读取所选文件", COLORS["primary"])
+            self.log("正在读取所选文件，请稍候...")
+            if platform == "android" and selected.startswith("content://"):
+                try:
+                    fd, target = prepare_android_content_fd(selected)
+                except Exception as exc:
+                    self.on_file_selection_failed(f"无法读取系统文档：{exc}")
+                    return
+                threading.Thread(target=self.copy_detached_fd_worker, args=(fd, target), daemon=True).start()
+                return
+            threading.Thread(target=self.resolve_selected_file_worker, args=(selected,), daemon=True).start()
+        except Exception as exc:
+            self.on_file_selection_failed(f"文件选择失败：{exc}")
+
+    def copy_detached_fd_worker(self, fd, target):
+        close_manually = True
+        try:
+            with os.fdopen(fd, "rb", closefd=True) as source, open(target, "wb") as out:
+                close_manually = False
+                while True:
+                    chunk = source.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            if not os.path.isfile(target) or os.path.getsize(target) <= 0:
+                raise OSError("所选文档为空或无法复制")
+            self.apply_selected_file(target, True)
+        except Exception as exc:
+            self.on_file_selection_failed(f"文档读取失败：{exc}")
+        finally:
+            if close_manually:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def resolve_selected_file_worker(self, selected):
+        try:
+            selected = str(selected)
+            copied_from_uri = selected.startswith("content://")
+            if copied_from_uri:
+                raise OSError("文档 URI 未能准备为可读取文件，请改用 Download 或 Documents 内置选择器")
+            if not os.path.isfile(selected):
+                raise OSError(f"未能读取所选文件：{selected}")
+            self.apply_selected_file(selected, copied_from_uri)
+        except Exception as exc:
+            self.on_file_selection_failed(str(exc))
+
+    @mainthread
+    def apply_selected_file(self, selected, copied_from_uri=False):
+        self.selected_file = selected
+        size_text = format_bytes(os.path.getsize(self.selected_file))
+        self.file_label.text = f"待发送文件：{os.path.basename(self.selected_file)}  ({size_text})"
+        self.set_status("文件已选择", COLORS["success"])
+        if copied_from_uri:
+            self.log("已读取系统文档选择器返回的文件。")
+        self.log(f"已选择文件：{self.selected_file}")
+
+    @mainthread
+    def on_file_selection_failed(self, message):
+        self.log(message)
+        self.set_status("文件选择失败", COLORS["warning"])
 
     @mainthread
     def on_native_folder_selected(self, selection):
         if not selection:
             return
-        selected = selection[0]
+        selected = str(selection[0])
         if selected.startswith("content://"):
             self.log("系统返回的是 content:// 目录地址，已继续使用默认 Download 保存位置。")
             return
         if os.path.isdir(selected):
             self.save_dir = selected
             self.save_label.text = f"保存位置：{self.save_dir}"
+            self.persist_setting("save_dir", self.save_dir)
             self.log(f"保存位置已设置为：{self.save_dir}")
         else:
             self.log(f"未能读取所选目录：{selected}")
@@ -1027,7 +1324,7 @@ class FileTransferApp(App):
 
             meta = recv_json(conn)
             conn.settimeout(TRANSFER_TIMEOUT)
-            filename = meta["filename"]
+            filename = safe_filename(meta["filename"])
             total_size = int(meta["size"])
             digest = meta["sha256"]
             compressed = bool(meta.get("compressed"))
@@ -1123,13 +1420,13 @@ class FileTransferApp(App):
             digest, total_size = sha256_file(send_path, self.cancel_event)
             filename = os.path.basename(send_path)
 
-            sock = tune_transfer_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+            target_text = self.ip_input.text.strip()
+            host, target_port = parse_target_address(target_text)
+            self.persist_peer_ip(target_text)
+            self.set_status(f"连接 {host}:{target_port}", COLORS["primary"])
+            self.log(f"正在连接 {host}:{target_port} ...")
+            sock = connect_tcp_with_retries(host, target_port, self.log)
             self.active_sock = sock
-            sock.settimeout(SOCKET_TIMEOUT)
-            target_ip = self.ip_input.text.strip()
-            self.set_status(f"连接 {target_ip}", COLORS["primary"])
-            self.log(f"正在连接 {target_ip}:{PORT} ...")
-            sock.connect((target_ip, PORT))
 
             send_json(
                 sock,
@@ -1235,6 +1532,20 @@ class FileTransferApp(App):
                 pass
             setattr(self, attr, None)
 
+    def on_stop(self):
+        self.close_sockets()
+        server = self.android_upload_server
+        self.android_upload_server = None
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+
     @mainthread
     def begin_meter(self, offset):
         self.current_start_time = time.monotonic()
@@ -1280,6 +1591,190 @@ def safe_filename(name):
     if not cleaned or cleaned in {".", ".."}:
         cleaned = f"file_{int(time.time())}"
     return cleaned.replace("/", "_").replace("\\", "_")
+
+
+ANDROID_SAFE_UPLOAD_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北洋闪传 - 文档安全选择</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+      color: #0b1526;
+      background: #eef6ff;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }
+    main {
+      width: min(100%, 560px);
+      background: #fff;
+      border: 1px solid #d8e4f2;
+      border-radius: 10px;
+      box-shadow: 0 12px 34px rgba(18, 69, 124, .13);
+      overflow: hidden;
+    }
+    header {
+      padding: 24px 22px;
+      color: #fff;
+      background: linear-gradient(135deg, #092f63, #0f73df);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    p { margin: 0; line-height: 1.7; color: #667589; }
+    header p { color: rgba(255,255,255,.82); }
+    section { padding: 22px; }
+    input[type=file] {
+      width: 100%;
+      min-height: 54px;
+      padding: 14px;
+      border: 2px dashed #abc5df;
+      border-radius: 8px;
+      background: #f7faff;
+      font: inherit;
+    }
+    button {
+      width: 100%;
+      min-height: 50px;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 8px;
+      color: #fff;
+      background: #0f73df;
+      font: inherit;
+      font-weight: 800;
+    }
+    button:disabled { opacity: .55; }
+    .status {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #eef6ff;
+      color: #092f63;
+      min-height: 48px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>北洋闪传</h1>
+      <p>文档安全选择页</p>
+    </header>
+    <section>
+      <p>请选择 PDF、Word、压缩包或其他文档。选择后会直接传回北洋闪传 App，不经过 Kivy 原生文档读取路径。</p>
+      <input id="file" type="file">
+      <button id="upload" disabled>使用这个文件</button>
+      <div id="status" class="status">等待选择文件。</div>
+    </section>
+  </main>
+  <script>
+    const fileInput = document.getElementById("file");
+    const upload = document.getElementById("upload");
+    const statusBox = document.getElementById("status");
+    let currentFile = null;
+    function fmt(bytes) {
+      const units = ["B", "KB", "MB", "GB"];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index += 1;
+      }
+      return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    }
+    fileInput.addEventListener("change", () => {
+      currentFile = fileInput.files && fileInput.files[0];
+      upload.disabled = !currentFile;
+      statusBox.textContent = currentFile ? `已选择：${currentFile.name}（${fmt(currentFile.size)}）` : "等待选择文件。";
+    });
+    upload.addEventListener("click", async () => {
+      if (!currentFile) return;
+      upload.disabled = true;
+      statusBox.textContent = "正在交给北洋闪传 App，请稍候...";
+      try {
+        const url = `/upload?filename=${encodeURIComponent(currentFile.name)}&size=${currentFile.size}`;
+        const response = await fetch(url, {method: "POST", body: currentFile});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `上传失败：${response.status}`);
+        statusBox.textContent = `已交给北洋闪传：${data.file}。现在可以返回 App 点击“立即发送”。`;
+      } catch (error) {
+        statusBox.textContent = error.message;
+        upload.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def create_android_safe_upload_handler(app):
+    class AndroidSafeUploadHandler(BaseHTTPRequestHandler):
+        server_version = "BeiyangFlashAndroidPicker/1.0"
+
+        def log_message(self, *_):
+            return
+
+        def send_bytes(self, body, content_type="text/plain; charset=utf-8", status=200):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_json(self, payload, status=200):
+            self.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in {"/", "/index.html"}:
+                self.send_bytes(ANDROID_SAFE_UPLOAD_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            self.send_json({"error": "页面不存在"}, 404)
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            try:
+                if parsed.path != "/upload":
+                    self.send_json({"error": "接口不存在"}, 404)
+                    return
+                params = urllib.parse.parse_qs(parsed.query)
+                filename = safe_filename((params.get("filename") or ["selected_file"])[0])
+                expected_size = int((params.get("size") or ["0"])[0])
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length <= 0:
+                    raise ValueError("浏览器没有传回文件内容")
+                staging_dir = Path(tempfile.gettempdir()) / "beiyang_flash_android_uploads"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                target = unique_path(staging_dir, filename)
+                received = 0
+                with open(target, "wb") as out:
+                    while received < length:
+                        chunk = self.rfile.read(min(WEB_CHUNK_SIZE, length - received))
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        received += len(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if expected_size and received != expected_size:
+                    raise ValueError("读取文件不完整，请重新选择")
+                app.apply_selected_file(str(target), False)
+                app.log(f"已通过文档安全选择页读取文件：{filename} ({format_bytes(received)})")
+                self.send_json({"ok": True, "file": filename, "size": received})
+            except Exception as exc:
+                app.log(f"文档安全选择失败：{exc}")
+                self.send_json({"error": str(exc)}, 400)
+
+    return AndroidSafeUploadHandler
 
 
 def test_writable_dir(folder):
@@ -2475,7 +2970,7 @@ DESKTOP_WEB_HTML = r"""<!doctype html>
           <button id="receiveBtn" class="success">开始接收</button>
           <button id="refreshBtn" class="secondary">刷新 IP</button>
         </div>
-        <p class="hint">接收方先点“开始接收”，发送方输入这里显示的 IP 后发送。</p>
+        <p class="hint">接收方先点“开始接收”，发送方输入这里显示的 IP 后发送；对方 IP 会自动记住。</p>
       </div>
 
       <div class="card">
@@ -2528,6 +3023,7 @@ DESKTOP_WEB_HTML = r"""<!doctype html>
     let selectedFile = null;
     let stagedKey = "";
     let busy = false;
+    const PEER_IP_KEY = "beiyang_flash_peer_ip";
 
     function fmt(bytes) {
       if (!Number.isFinite(bytes)) return "--";
@@ -2571,6 +3067,7 @@ DESKTOP_WEB_HTML = r"""<!doctype html>
       const info = await api("/api/info");
       $("tcpPort").textContent = info.tcp_port;
       $("saveDir").value = info.save_dir;
+      $("peerIp").value = localStorage.getItem(PEER_IP_KEY) || $("peerIp").value;
       $("ipChips").innerHTML = info.ips.map(ip => `<div class="chip">${ip}</div>`).join("");
       applyStatus(info.state);
     }
@@ -2582,6 +3079,10 @@ DESKTOP_WEB_HTML = r"""<!doctype html>
     }
 
     $("refreshBtn").addEventListener("click", loadInfo);
+    $("peerIp").addEventListener("input", () => {
+      const value = $("peerIp").value.trim();
+      if (value) localStorage.setItem(PEER_IP_KEY, value);
+    });
     $("saveBtn").addEventListener("click", async () => {
       try {
         const data = await api("/api/config", {
@@ -2654,6 +3155,7 @@ DESKTOP_WEB_HTML = r"""<!doctype html>
         await stageSelectedFile();
         const peerIp = $("peerIp").value.trim();
         if (!peerIp) throw new Error("请先输入对方 IP");
+        localStorage.setItem(PEER_IP_KEY, peerIp);
         const data = await api("/api/send/start", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
@@ -2803,7 +3305,10 @@ def parse_target_address(text):
     value = value.replace("http://", "").replace("https://", "").split("/")[0]
     if ":" in value:
         host, raw_port = value.rsplit(":", 1)
-        return host.strip(), int(raw_port)
+        host = host.strip()
+        if not host:
+            raise ValueError("对方 IP 不能为空")
+        return host, int(raw_port)
     return value, PORT
 
 
@@ -2935,10 +3440,8 @@ def desktop_send_worker(state, target_text, compress=False):
         filename = os.path.basename(send_path)
         state.set_status(f"连接 {host}:{target_port}", file_name=filename)
         state.log(f"正在连接 {host}:{target_port} ...")
-        sock = tune_transfer_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        sock = connect_tcp_with_retries(host, target_port, state.log)
         state.active_sock = sock
-        sock.settimeout(SOCKET_TIMEOUT)
-        sock.connect((host, target_port))
         send_json(
             sock,
             {
